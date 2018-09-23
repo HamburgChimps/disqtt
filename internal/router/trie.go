@@ -1,0 +1,323 @@
+// Trie code is heavily borrowed from https://github.com/teambition/trie-mux
+
+package router
+
+import (
+	"fmt"
+	"github.com/eclipse/paho.mqtt.golang/paho"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+type HandlerFunc func(*paho.Publish)
+
+// Options is options for Trie.
+type Options struct {
+	// Ignore case when matching Topic path.
+	IgnoreCase bool
+}
+
+// the valid characters for the path component:
+// [A-Za-z0-9!$%&'()*+,-.:;=@_~]
+// http://stackoverflow.com/questions/4669692/valid-characters-for-directory-part-of-a-url-for-short-links
+// https://tools.ietf.org/html/rfc3986#section-3.3
+var (
+	multiSlashReg  = regexp.MustCompile(`/{2,}`)
+	wordReg        = regexp.MustCompile(`^\w+$`)
+	suffixReg      = regexp.MustCompile(`\+[A-Za-z0-9!$%&'*+,-.:;=@_~]*$`)
+	defaultOptions = Options{
+		IgnoreCase: true,
+	}
+)
+
+// NewTrie returns a trie
+//
+//  trie := New()
+//  // disable IgnoreCase
+//  trie := New(Options{})
+//
+func NewTrie(args ...Options) *Trie {
+	opts := defaultOptions
+	if len(args) > 0 {
+		opts = args[0]
+	}
+
+	return &Trie{
+		ignoreCase: opts.IgnoreCase,
+		root: &Node{
+			parent:   nil,
+			children: make(map[string]*Node),
+		},
+	}
+}
+
+// Trie represents a trie that defining patterns and matching topic.
+type Trie struct {
+	ignoreCase bool
+	root       *Node
+}
+
+// Define define a pattern on the trie and returns the endpoint node for the pattern.
+//
+//  trie := New()
+//  node1 := trie.Define("/a")
+//  node2 := trie.Define("/a/b")
+//  node3 := trie.Define("/a/b")
+//  // node2.parent == node1
+//  // node2 == node3
+//
+// The defined pattern can contain three types of parameters:
+//
+// | Syntax | Description |
+// |--------|------|
+// | `:name` | named parameter |
+// | `#` | catch-all parameter |
+//
+func (t *Trie) Define(pattern string) *Node {
+	if strings.Contains(pattern, "//") {
+		panic(fmt.Errorf(`multi-slash exist: "%s"`, pattern))
+	}
+
+	_pattern := strings.TrimPrefix(pattern, "/")
+	node := defineNode(t.root, strings.Split(_pattern, "/"), t.ignoreCase)
+
+	if node.pattern == "" {
+		node.pattern = pattern
+	}
+	return node
+}
+
+// Match try to match path. It will returns a Matched instance that
+// includes	*Node, Params and Tsr flag when matching success, otherwise a nil.
+//
+//  matched := trie.Match("/a/b")
+//
+func (t *Trie) Match(path string) *Matched {
+	if path == "" || path[0] != '/' {
+		panic(fmt.Errorf(`path is not start with "/": "%s"`, path))
+	}
+
+	start := 1
+	end := len(path)
+	matched := new(Matched)
+	parent := t.root
+	for i := 1; i <= end; i++ {
+		if i < end && path[i] != '/' {
+			continue
+		}
+		segment := path[start:i]
+		node := matchNode(parent, segment)
+		if t.ignoreCase && node == nil {
+			node = matchNode(parent, strings.ToLower(segment))
+		}
+		if node == nil {
+			return matched
+		}
+
+		parent = node
+		if parent.name != "" {
+			if matched.Params == nil {
+				matched.Params = make(map[string]string)
+			}
+			if parent.wildcard {
+				matched.Params[parent.name] = path[start:end]
+				break
+			} else {
+				if parent.suffix != "" {
+					segment = segment[0 : len(segment)-len(parent.suffix)]
+				}
+				matched.Params[parent.name] = segment
+			}
+		}
+		start = i + 1
+	}
+
+	switch {
+	case parent.endpoint:
+		matched.Node = parent
+	}
+
+	return matched
+}
+
+// Matched is a result returned by Trie.Match.
+type Matched struct {
+	// Either a Node pointer when matched or nil
+	Node *Node
+
+	// Either a map contained matched values or empty map.
+	Params map[string]string
+}
+
+// Node represents a node on defined patterns that can be matched.
+type Node struct {
+	name, pattern, segment, suffix string
+	endpoint, wildcard             bool
+	parent                         *Node
+	varyChildren                   []*Node
+	children                       map[string]*Node
+	handler                        HandlerFunc // only one handler
+	regex                          *regexp.Regexp
+}
+
+func (n *Node) getSegments() string {
+	segments := n.segment
+	if n.parent != nil {
+		segments = n.parent.getSegments() + "/" + segments
+	}
+	return segments
+}
+
+func (n *Node) getChild(key string) *Node {
+	return n.children[key]
+}
+
+// Handle is used to mount a handler to the node.
+//
+//  t := New()
+//  node := t.Define("/a/b")
+//  node.Handle(handler1)
+//
+func (n *Node) Handle(handler HandlerFunc) {
+	if n.GetHandler() != nil {
+		panic(fmt.Errorf(`"%s" already defined`, n.getSegments()))
+	}
+	n.handler = handler
+}
+
+// GetHandler ...
+func (n *Node) GetHandler() HandlerFunc {
+	return n.handler
+}
+
+// GetPattern returns pattern defined on the node
+func (n *Node) GetPattern() string {
+	return n.pattern
+}
+
+func defineNode(parent *Node, segments []string, ignoreCase bool) *Node {
+	segment := segments[0]
+	segments = segments[1:]
+	child := parseNode(parent, segment, ignoreCase)
+
+	if len(segments) == 0 {
+		child.endpoint = true
+		return child
+	}
+	if child.wildcard {
+		panic(fmt.Errorf(`can't define pattern after wildcard: "%s"`, child.getSegments()))
+	}
+	return defineNode(child, segments, ignoreCase)
+}
+
+func matchNode(parent *Node, segment string) (child *Node) {
+	if child = parent.getChild(segment); child != nil {
+		return
+	}
+	for _, child = range parent.varyChildren {
+		_segment := segment
+		if child.suffix != "" {
+			if segment == child.suffix || !strings.HasSuffix(segment, child.suffix) {
+				continue
+			}
+			_segment = segment[0 : len(segment)-len(child.suffix)]
+		}
+		if child.regex != nil && !child.regex.MatchString(_segment) {
+			continue
+		}
+		return
+	}
+	return nil
+}
+
+func parseNode(parent *Node, segment string, ignoreCase bool) *Node {
+	_segment := segment
+
+	if ignoreCase {
+		_segment = strings.ToLower(_segment)
+	}
+	if node := parent.getChild(_segment); node != nil {
+		return node
+	}
+
+	node := &Node{
+		segment:  segment,
+		parent:   parent,
+		children: make(map[string]*Node),
+	}
+
+	switch {
+	case segment == "":
+		parent.children[segment] = node
+
+	case segment[0] == ':':
+		name := segment[1:]
+		var suffix = suffixReg.FindString(name)
+		if suffix != "" {
+			name = name[0 : len(name)-len(suffix)]
+			node.suffix = suffix[1:]
+			if node.suffix == "" {
+				panic(fmt.Errorf(`invalid pattern: "%s"`, node.getSegments()))
+			}
+		}
+
+		// name must be word characters `[0-9A-Za-z_]`
+		if !wordReg.MatchString(name) {
+			panic(fmt.Errorf(`invalid pattern: "%s"`, node.getSegments()))
+		}
+		node.name = name
+		// check if node exists
+		for _, child := range parent.varyChildren {
+			if child.wildcard {
+				if !node.wildcard {
+					panic(fmt.Errorf(`can't define "%s" after "%s"`, node.getSegments(), child.getSegments()))
+				}
+				if child.name != node.name {
+					panic(fmt.Errorf(`invalid pattern name "%s", as prev defined "%s"`, node.name, child.getSegments()))
+				}
+				return child
+			}
+
+			if child.suffix != node.suffix {
+				continue
+			}
+
+			if !node.wildcard && (child.regex == nil && node.regex == nil) ||
+				child.regex != nil && node.regex != nil && child.regex.String() == node.regex.String() {
+				if child.name != node.name {
+					panic(fmt.Errorf(`invalid pattern name "%s", as prev defined "%s"`, node.name, child.getSegments()))
+				}
+				return child
+			}
+		}
+		parent.varyChildren = append(parent.varyChildren, node)
+		if s := parent.varyChildren; len(s) > 1 {
+			sort.SliceStable(s, func(i, j int) bool {
+				// i > j
+				switch {
+				case s[i].suffix == "" && s[j].suffix != "":
+					return false
+				case s[i].suffix != "" && s[j].suffix == "":
+					return true
+				case s[i].regex != nil && s[j].regex == nil:
+					return true
+				default:
+					return false
+				}
+			})
+		}
+
+	default:
+		parent.children[_segment] = node
+	}
+
+	return node
+}
+
+func fixPath(path string) string {
+	if !strings.Contains(path, "//") {
+		return path
+	}
+	return multiSlashReg.ReplaceAllString(path, "/")
+}

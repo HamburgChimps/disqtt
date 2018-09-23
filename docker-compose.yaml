@@ -1,0 +1,29 @@
+version: '3.1'
+services:
+  broker:
+    image: volantmq/volantmq
+    hostname: broker
+    volumes:
+      - ./broker-config.yaml:/etc/volantmq/config.yaml
+    environment:
+      VOLANTMQ_CONFIG: "/etc/volantmq/config.yaml"
+
+  discovery:
+    image: golang:1.11
+    hostname: discovery
+    depends_on:
+      - broker
+    volumes:
+      - ./bin/client:/client
+    command: /client
+
+  curiousity:
+    image: golang:1.11
+    hostname: curiousity
+    depends_on:
+      - broker
+    volumes:
+      - ./bin/service:/service
+    command: /service
+
+
